@@ -1,0 +1,49 @@
+interface apb_if(input logic clk);
+
+    logic reset;
+
+    logic psel;
+    logic penable;
+    logic pwrite;
+    logic [7:0] paddr;
+    logic [7:0] pwdata;
+    logic [7:0] prdata;
+
+endinterface
+
+module apb_slave(
+    input logic clk,
+    input logic reset,
+
+    input logic psel,
+    input logic penable,
+    input logic pwrite,
+    input logic [7:0] paddr,
+    input logic [7:0] pwdata,
+
+    output logic [7:0] prdata
+);
+
+    logic [7:0] memory [0:255];
+
+    always_ff @(posedge clk) begin
+
+        if (reset) begin
+            prdata <= 8'h00;
+        end
+
+        else if (psel && penable) begin
+
+            if (pwrite) begin
+                memory[paddr] <= pwdata;
+            end
+
+            else begin
+                prdata <= memory[paddr];
+            end
+
+        end
+
+    end
+
+endmodule
