@@ -1,0 +1,272 @@
+`timescale 1ns/1ps
+
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+// Interface connects the testbench with the DUT
+interface simple_if(input logic clk);
+    logic [7:0] data;
+    logic valid;
+endinterface
+
+
+// Transaction carries data from sequence to driver
+class transaction extends uvm_sequence_item;
+
+    rand bit [7:0] data;
+
+    `uvm_object_utils(transaction)
+
+    function new(string name="transaction");
+        super.new(name);
+    endfunction
+
+endclass
+
+
+// Generates transactions
+class my_sequence extends uvm_sequence #(transaction);
+
+    `uvm_object_utils(my_sequence)
+
+    function new(string name="my_sequence");
+        super.new(name);
+    endfunction
+
+    task body();
+        transaction tr;
+
+        repeat(5) begin
+            tr = transaction::type_id::create("tr");
+
+            start_item(tr);
+            assert(tr.randomize());
+            finish_item(tr);
+        end
+    endtask
+
+endclass
+
+
+// Original driver implementation
+class base_driver extends uvm_driver #(transaction);
+
+    `uvm_component_utils(base_driver)
+
+    virtual simple_if vif;
+
+    function new(string name="base_driver", uvm_component parent=null);
+        super.new(name,parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        if(!uvm_config_db#(virtual simple_if)::get(this,"","vif",vif))
+            `uvm_fatal("NOVIF","Virtual interface not found")
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        forever begin
+            seq_item_port.get_next_item(req);
+
+            @(posedge vif.clk);
+
+            vif.data <= req.data;
+            vif.valid <= 1'b1;
+
+            `uvm_info("BASE_DRIVER",
+                $sformatf("Base Driver drove data = %0d",req.data),
+                UVM_MEDIUM)
+
+            @(posedge vif.clk);
+
+            vif.valid <= 1'b0;
+
+            seq_item_port.item_done();
+        end
+    endtask
+
+endclass
+
+
+// New driver implementation that will replace base_driver
+class new_driver extends base_driver;
+
+    `uvm_component_utils(new_driver)
+
+    function new(string name="new_driver", uvm_component parent=null);
+        super.new(name,parent);
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        forever begin
+            seq_item_port.get_next_item(req);
+
+            @(posedge vif.clk);
+
+            // Different behavior from the original driver
+            vif.data <= req.data + 1;
+            vif.valid <= 1'b1;
+
+            `uvm_info("NEW_DRIVER",
+                $sformatf("New Driver drove data = %0d",req.data + 1),
+                UVM_MEDIUM)
+
+            @(posedge vif.clk);
+
+            vif.valid <= 1'b0;
+
+            seq_item_port.item_done();
+        end
+    endtask
+
+endclass
+
+
+// Agent contains the sequencer and driver
+class my_agent extends uvm_agent;
+
+    `uvm_component_utils(my_agent)
+
+    uvm_sequencer #(transaction) seqr;
+    base_driver drv;
+
+    function new(string name="my_agent", uvm_component parent=null);
+        super.new(name,parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        seqr = uvm_sequencer#(transaction)::type_id::create("seqr",this);
+
+ // Factory creates the driver.
+ // Because of the override, new_driver will actually be created.
+        drv = base_driver::type_id::create("drv",this);
+    endfunction
+
+    function void connect_phase(uvm_phase phase);
+        super.connect_phase(phase);
+
+        drv.seq_item_port.connect(seqr.seq_item_export);
+    endfunction
+
+endclass
+
+
+// Environment contains the agent
+class my_env extends uvm_env;
+
+    `uvm_component_utils(my_env)
+
+    my_agent agent;
+
+    function new(string name="my_env", uvm_component parent=null);
+        super.new(name,parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        agent = my_agent::type_id::create("agent",this);
+    endfunction
+
+endclass
+
+
+// Test controls the factory override and starts the sequence
+class my_test extends uvm_test;
+
+    `uvm_component_utils(my_test)
+
+    my_env env;
+
+    function new(string name="my_test", uvm_component parent=null);
+        super.new(name,parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        // Factory override:
+        // Whenever base_driver is requested, create new_driver instead.
+        base_driver::type_id::set_type_override(new_driver::get_type());
+
+        env = my_env::type_id::create("env",this);
+    endfunction
+
+    task run_phase(uvm_phase phase);
+
+        my_sequence seq;
+
+        phase.raise_objection(this);
+
+        seq = my_sequence::type_id::create("seq");
+
+        // Start sequence on the agent's sequencer
+        seq.start(env.agent.seqr);
+
+        #20;
+
+        phase.drop_objection(this);
+
+    endtask
+
+endclass
+
+
+// Simple DUT
+module dut(
+    input logic clk,
+    input logic [7:0] data,
+    input logic valid
+);
+
+    always @(posedge clk) begin
+        if(valid)
+            $display("DUT received data = %0d",data);
+    end
+
+endmodule
+
+
+// Top-level testbench
+module tb;
+
+    logic clk;
+
+    // Clock generation
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk;
+    end
+
+    simple_if vif(clk);
+
+    dut d(
+        .clk(clk),
+        .data(vif.data),
+        .valid(vif.valid)
+    );
+
+    initial begin
+
+        $dumpfile("waveform.vcd");
+        $dumpvars(0,tb);
+
+        vif.data = 0;
+        vif.valid = 0;
+
+        uvm_config_db#(virtual simple_if)::set(
+            null,
+            "*",
+            "vif",
+            vif
+        );
+
+        run_test("my_test");
+
+    end
+
+endmodule
