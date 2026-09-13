@@ -1,0 +1,278 @@
+
+// apb_uvm_lab.sv - Full APB UVM Testbench
+`include "uvm_macros.svh"
+import uvm_pkg::*;
+
+// Interface
+interface apb_if(input bit pclk, input bit preset_n);
+  logic [31:0] paddr;
+  logic [31:0] pwdata;
+  logic [31:0] prdata;
+  logic        pwrite;
+  logic        psel;
+  logic        penable;
+  logic        pready;
+  logic        pslverr;
+endinterface
+
+// Transaction
+typedef enum bit {APB_READ = 1'b0, APB_WRITE = 1'b1} apb_dir_e;
+
+class apb_transaction extends uvm_sequence_item;
+  rand bit [31:0] addr;
+  rand bit [31:0] data;
+  rand apb_dir_e  direction;
+  bit  [31:0] rdata;
+  bit         pslverr;
+
+  `uvm_object_utils_begin(apb_transaction)
+    `uvm_field_int(addr, UVM_ALL_ON)
+    `uvm_field_int(data, UVM_ALL_ON)
+    `uvm_field_enum(apb_dir_e, direction, UVM_ALL_ON)
+    `uvm_field_int(rdata, UVM_ALL_ON)
+    `uvm_field_int(pslverr, UVM_ALL_ON)
+  `uvm_object_utils_end
+
+  function new(string name = "apb_transaction");
+    super.new(name);
+  endfunction
+
+  constraint addr_align_c { addr[1:0] == 2'b00; }
+  constraint addr_range_c { addr inside {[32'h0000_0000 : 32'h0000_0FFF]}; }
+
+  function string convert2string();
+    return $sformatf("dir=%s addr=0x%0h data=0x%0h rdata=0x%0h err=%0b",
+                      direction.name(), addr, data, rdata, pslverr);
+  endfunction
+endclass
+
+// Sequence
+class apb_basic_seq extends uvm_sequence #(apb_transaction);
+  `uvm_object_utils(apb_basic_seq)
+
+  function new(string name = "apb_basic_seq");
+    super.new(name);
+  endfunction
+
+  task body();
+    apb_transaction req;
+    repeat (10) begin
+      req = apb_transaction::type_id::create("req");
+      start_item(req);
+      assert(req.randomize());
+      finish_item(req);
+    end
+  endtask
+endclass
+
+// Driver
+class apb_driver extends uvm_driver #(apb_transaction);
+  `uvm_component_utils(apb_driver)
+  virtual apb_if vif;
+
+  function new(string name = "apb_driver", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual apb_if)::get(this, "", "vif", vif))
+      `uvm_fatal("APB_DRV", "vif not set")
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    reset_signals();
+    forever begin
+      apb_transaction req;
+      seq_item_port.get_next_item(req);
+      drive_transaction(req);
+      seq_item_port.item_done();
+    end
+  endtask
+
+  task reset_signals();
+    vif.psel    <= 1'b0;
+    vif.penable <= 1'b0;
+    vif.pwrite  <= 1'b0;
+    vif.paddr   <= '0;
+    vif.pwdata  <= '0;
+    @(posedge vif.pclk iff vif.preset_n == 1'b1);
+  endtask
+
+  task drive_transaction(apb_transaction req);
+    @(posedge vif.pclk);
+    vif.psel    <= 1'b1;
+    vif.penable <= 1'b0;
+    vif.pwrite  <= (req.direction == APB_WRITE);
+    vif.paddr   <= req.addr;
+    vif.pwdata  <= (req.direction == APB_WRITE) ? req.data : '0;
+
+    @(posedge vif.pclk);
+    vif.penable <= 1'b1;
+
+    wait (vif.pready == 1'b1);
+
+    if (req.direction == APB_READ)
+      req.rdata = vif.prdata;
+    req.pslverr = vif.pslverr;
+
+    @(posedge vif.pclk);
+    vif.psel    <= 1'b0;
+    vif.penable <= 1'b0;
+
+    `uvm_info("APB_DRV", req.convert2string(), UVM_MEDIUM)
+  endtask
+endclass
+
+// Monitor
+class apb_monitor extends uvm_monitor;
+  `uvm_component_utils(apb_monitor)
+  virtual apb_if vif;
+  uvm_analysis_port #(apb_transaction) ap;
+
+  function new(string name = "apb_monitor", uvm_component parent = null);
+    super.new(name, parent);
+    ap = new("ap", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual apb_if)::get(this, "", "vif", vif))
+      `uvm_fatal("APB_MON", "vif not set")
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    forever begin
+      apb_transaction tr;
+      @(posedge vif.pclk iff (vif.psel && vif.penable));
+      tr = apb_transaction::type_id::create("tr");
+      tr.addr      = vif.paddr;
+      tr.direction = vif.pwrite ? APB_WRITE : APB_READ;
+      tr.data      = vif.pwrite ? vif.pwdata : vif.prdata;
+      tr.pslverr   = vif.pslverr;
+      ap.write(tr);
+      `uvm_info("APB_MON", tr.convert2string(), UVM_HIGH)
+    end
+  endtask
+endclass
+
+// Sequencer
+class apb_sequencer extends uvm_sequencer #(apb_transaction);
+  `uvm_component_utils(apb_sequencer)
+  function new(string name = "apb_sequencer", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+endclass
+
+// Agent
+class apb_agent extends uvm_agent;
+  `uvm_component_utils(apb_agent)
+
+  apb_driver    drv;
+  apb_sequencer sqr;
+  apb_monitor   mon;
+
+  function new(string name = "apb_agent", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    drv = apb_driver::type_id::create("drv", this);
+    sqr = apb_sequencer::type_id::create("sqr", this);
+    mon = apb_monitor::type_id::create("mon", this);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    drv.seq_item_port.connect(sqr.seq_item_export);
+  endfunction
+endclass
+
+// Environment
+class apb_env extends uvm_env;
+  `uvm_component_utils(apb_env)
+  apb_agent agent;
+
+  function new(string name = "apb_env", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    agent = apb_agent::type_id::create("agent", this);
+  endfunction
+endclass
+
+// Test
+class apb_base_test extends uvm_test;
+  `uvm_component_utils(apb_base_test)
+  apb_env env;
+
+  function new(string name = "apb_base_test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    env = apb_env::type_id::create("env", this);
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    apb_basic_seq seq;
+    phase.raise_objection(this);
+    seq = apb_basic_seq::type_id::create("seq");
+    seq.start(env.agent.sqr);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+
+// Simple APB Slave DUT (behavioral stub)
+module apb_slave(apb_if vif);
+  reg [31:0] mem [0:4095];
+
+  always @(posedge vif.pclk or negedge vif.preset_n) begin
+    if (!vif.preset_n) begin
+      vif.pready  <= 1'b0;
+      vif.prdata  <= '0;
+      vif.pslverr <= 1'b0;
+    end else begin
+      vif.pready  <= 1'b0;
+      vif.pslverr <= 1'b0;
+      if (vif.psel && vif.penable) begin
+        vif.pready <= 1'b1;
+        if (vif.pwrite)
+          mem[vif.paddr[13:2]] <= vif.pwdata;
+        else
+          vif.prdata <= mem[vif.paddr[13:2]];
+      end
+    end
+  end
+endmodule
+
+// Top module
+module top;
+  bit pclk;
+  bit preset_n;
+ 
+  always #5 pclk = ~pclk;
+ 
+  initial begin
+    preset_n = 0;
+    #20 preset_n = 1;
+  end
+ 
+  apb_if vif(pclk, preset_n);
+ 
+  apb_slave dut(.vif(vif));
+ 
+  initial begin
+    $dumpfile("apb_waveform.vcd");
+    $dumpvars(0, top);
+  end
+
+  initial begin
+    uvm_config_db#(virtual apb_if)::set(null, "*", "vif", vif);
+    run_test("apb_base_test");
+  end
+endmodule
